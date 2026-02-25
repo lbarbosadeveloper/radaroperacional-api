@@ -1,5 +1,4 @@
 {
-  "name": "ai-panel-server",
   "name": "radaroperacional-api",
   "version": "1.0.0",
   "type": "module",
@@ -7,7 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
-    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.5.3",
+    "node-fetch": "^3.3.2"
+  }
+}
