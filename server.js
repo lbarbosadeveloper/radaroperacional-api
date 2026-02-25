@@ -152,32 +152,77 @@ app.get("/search", async (req, res) => {
 // ✅ CLIMATEMPO /weather
 // ============================
 // ============================
-// ✅ WEATHER (sem token) — Open-Meteo
-// Mantém a mesma resposta: { ok, place, cond, min, max, updatedAt }
+// ============================
+// ✅ WEATHER (Open-Meteo) com cache + retry
 // ============================
 
-// Água Santa / RJ (aprox) — ajuste se quiser
 const WX_DEFAULT = {
   place: "Água Santa • RJ",
   lat: -22.8776,
   lon: -43.3043,
 };
 
+let WEATHER_CACHE = null; // { ok:true, place, cond, min, max, updatedAt, stale? }
+
 function codeToPt(code) {
-  // WMO weather codes (bem resumido)
   if (code === 0) return "Céu limpo";
   if (code === 1 || code === 2) return "Poucas nuvens";
   if (code === 3) return "Nublado";
   if (code === 45 || code === 48) return "Neblina";
   if ([51, 53, 55].includes(code)) return "Garoa";
-  if ([56, 57].includes(code)) return "Garoa congelante";
   if ([61, 63, 65].includes(code)) return "Chuva";
-  if ([66, 67].includes(code)) return "Chuva congelante";
-  if ([71, 73, 75, 77].includes(code)) return "Neve";
   if ([80, 81, 82].includes(code)) return "Pancadas de chuva";
-  if ([85, 86].includes(code)) return "Pancadas de neve";
   if ([95, 96, 99].includes(code)) return "Tempestade";
   return "—";
+}
+
+async function fetchWithTimeout(url, ms = 8000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await _fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "radar-operacional/1.0" } });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function getOpenMeteo({ lat, lon }) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast` +
+    `?latitude=${encodeURIComponent(lat)}` +
+    `&longitude=${encodeURIComponent(lon)}` +
+    `&current=weather_code,temperature_2m` +
+    `&daily=temperature_2m_min,temperature_2m_max` +
+    `&timezone=America%2FSao_Paulo`;
+
+  // 2 tentativas rápidas (pra quando dá timeout momentâneo)
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const r = await fetchWithTimeout(url, 8000);
+      const text = await r.text();
+
+      if (!r.ok) {
+        throw new Error(`Open-Meteo HTTP ${r.status}: ${text.slice(0, 140)}`);
+      }
+
+      const j = JSON.parse(text);
+
+      const code = j?.current?.weather_code;
+      const cond = codeToPt(code);
+      const min = j?.daily?.temperature_2m_min?.[0] ?? null;
+      const max = j?.daily?.temperature_2m_max?.[0] ?? null;
+
+      if (min == null || max == null) throw new Error("Open-Meteo sem min/max no retorno.");
+
+      return { cond, min, max };
+    } catch (e) {
+      lastErr = e;
+      // pequena pausa antes de retry
+      await new Promise((rr) => setTimeout(rr, 250));
+    }
+  }
+  throw lastErr || new Error("Falha desconhecida Open-Meteo.");
 }
 
 app.get("/weather", async (req, res) => {
@@ -186,43 +231,37 @@ app.get("/weather", async (req, res) => {
     const lon = Number(req.query.lon ?? WX_DEFAULT.lon);
     const place = String(req.query.place || WX_DEFAULT.place);
 
-    const url =
-      `https://api.open-meteo.com/v1/forecast` +
-      `?latitude=${encodeURIComponent(lat)}` +
-      `&longitude=${encodeURIComponent(lon)}` +
-      `&current=weather_code,temperature_2m` +
-      `&daily=temperature_2m_min,temperature_2m_max` +
-      `&timezone=America%2FSao_Paulo`;
+    const data = await getOpenMeteo({ lat, lon });
 
-    const r = await _fetch(url, { headers: { "User-Agent": "radar-operacional/1.0" } });
-    const j = await r.json().catch(() => null);
-
-    if (!r.ok || !j) {
-      return res.status(502).json({ ok: false, error: "Falha ao obter clima (Open-Meteo)." });
-    }
-
-    const code = j?.current?.weather_code;
-    const cond = codeToPt(code);
-
-    const min = j?.daily?.temperature_2m_min?.[0] ?? null;
-    const max = j?.daily?.temperature_2m_max?.[0] ?? null;
-
-    res.json({
+    WEATHER_CACHE = {
       ok: true,
       place,
-      cond,
-      min,
-      max,
+      cond: data.cond,
+      min: data.min,
+      max: data.max,
       updatedAt: new Date().toISOString(),
-    });
+      stale: false,
+    };
+
+    return res.json(WEATHER_CACHE);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || "Erro no /weather" });
+    // ✅ Se falhar, mas temos cache, devolve cache "stale" (não some do painel)
+    if (WEATHER_CACHE?.ok) {
+      return res.json({ ...WEATHER_CACHE, stale: true, error: "Falha ao atualizar agora." });
+    }
+
+    // Sem cache ainda → devolve erro com detalhe (pra debug)
+    return res.status(502).json({
+      ok: false,
+      error: "Falha ao obter clima (Open-Meteo).",
+      details: String(e?.message || e).slice(0, 180),
+    });
   }
 });
-
 // ============================
 // Start
 // ============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚨 RADAR API NOVA SUBIU — server.js ATUAL — porta", PORT));
+
 
