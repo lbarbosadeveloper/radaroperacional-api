@@ -153,7 +153,8 @@ app.get("/search", async (req, res) => {
 // ============================
 // ============================
 // ============================
-// ✅ WEATHER (Open-Meteo) com cache + retry
+// ============================
+// ✅ WEATHER (sem token) — Open-Meteo + fallback wttr.in + cache
 // ============================
 
 const WX_DEFAULT = {
@@ -162,9 +163,9 @@ const WX_DEFAULT = {
   lon: -43.3043,
 };
 
-let WEATHER_CACHE = null; // { ok:true, place, cond, min, max, updatedAt, stale? }
+let WEATHER_CACHE = null; // { ok:true, place, cond, min, max, updatedAt, stale, provider }
 
-function codeToPt(code) {
+function codeToPtFromWmo(code) {
   if (code === 0) return "Céu limpo";
   if (code === 1 || code === 2) return "Poucas nuvens";
   if (code === 3) return "Nublado";
@@ -176,62 +177,105 @@ function codeToPt(code) {
   return "—";
 }
 
-async function fetchWithTimeout(url, ms = 8000) {
+function textToPtWttr(desc = "") {
+  const t = String(desc || "").toLowerCase();
+  if (t.includes("thunder") || t.includes("storm")) return "Tempestade";
+  if (t.includes("rain") || t.includes("shower") || t.includes("drizzle")) return "Chuva";
+  if (t.includes("fog") || t.includes("mist") || t.includes("haze")) return "Neblina";
+  if (t.includes("cloud")) return "Nublado";
+  if (t.includes("sun") || t.includes("clear")) return "Céu limpo";
+  return "—";
+}
+
+async function fetchTextWithTimeout(url, ms = 8000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    return await _fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "radar-operacional/1.0" } });
+    const r = await _fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        "User-Agent": "radar-operacional/1.0",
+        "Accept": "application/json,text/plain,*/*",
+      },
+    });
+    const text = await r.text();
+    return { r, text };
   } finally {
     clearTimeout(t);
   }
 }
 
-async function getOpenMeteo({ lat, lon }) {
+async function tryOpenMeteo(lat, lon) {
   const url =
     `https://api.open-meteo.com/v1/forecast` +
     `?latitude=${encodeURIComponent(lat)}` +
     `&longitude=${encodeURIComponent(lon)}` +
     `&current=weather_code,temperature_2m` +
     `&daily=temperature_2m_min,temperature_2m_max` +
+    `&forecast_days=1` +
     `&timezone=America%2FSao_Paulo`;
 
-  // 2 tentativas rápidas (pra quando dá timeout momentâneo)
+  // 2 tentativas rápidas
   let lastErr = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const r = await fetchWithTimeout(url, 8000);
-      const text = await r.text();
-
-      if (!r.ok) {
-        throw new Error(`Open-Meteo HTTP ${r.status}: ${text.slice(0, 140)}`);
-      }
-
+      const { r, text } = await fetchTextWithTimeout(url, 9000);
+      if (!r.ok) throw new Error(`Open-Meteo HTTP ${r.status}: ${text.slice(0, 160)}`);
       const j = JSON.parse(text);
 
       const code = j?.current?.weather_code;
-      const cond = codeToPt(code);
+      const cond = codeToPtFromWmo(code);
       const min = j?.daily?.temperature_2m_min?.[0] ?? null;
       const max = j?.daily?.temperature_2m_max?.[0] ?? null;
 
       if (min == null || max == null) throw new Error("Open-Meteo sem min/max no retorno.");
-
-      return { cond, min, max };
+      return { provider: "open-meteo", cond, min, max };
     } catch (e) {
       lastErr = e;
-      // pequena pausa antes de retry
       await new Promise((rr) => setTimeout(rr, 250));
     }
   }
   throw lastErr || new Error("Falha desconhecida Open-Meteo.");
 }
 
-app.get("/weather", async (req, res) => {
-  try {
-    const lat = Number(req.query.lat ?? WX_DEFAULT.lat);
-    const lon = Number(req.query.lon ?? WX_DEFAULT.lon);
-    const place = String(req.query.place || WX_DEFAULT.place);
+async function tryWttr(lat, lon) {
+  // wttr.in (sem token) — formato j1
+  const url = `https://wttr.in/${lat},${lon}?format=j1`;
 
-    const data = await getOpenMeteo({ lat, lon });
+  const { r, text } = await fetchTextWithTimeout(url, 9000);
+  if (!r.ok) throw new Error(`wttr.in HTTP ${r.status}: ${text.slice(0, 160)}`);
+
+  const j = JSON.parse(text);
+  const today = j?.weather?.[0];
+
+  const min = today?.mintempC != null ? Number(today.mintempC) : null;
+  const max = today?.maxtempC != null ? Number(today.maxtempC) : null;
+
+  const desc =
+    today?.hourly?.[0]?.weatherDesc?.[0]?.value ||
+    j?.current_condition?.[0]?.weatherDesc?.[0]?.value ||
+    "";
+
+  const cond = textToPtWttr(desc);
+
+  if (min == null || max == null) throw new Error("wttr.in sem min/max no retorno.");
+  return { provider: "wttr.in", cond, min, max };
+}
+
+app.get("/weather", async (req, res) => {
+  const lat = Number(req.query.lat ?? WX_DEFAULT.lat);
+  const lon = Number(req.query.lon ?? WX_DEFAULT.lon);
+  const place = String(req.query.place || WX_DEFAULT.place);
+
+  try {
+    // 1) tenta Open-Meteo
+    let data;
+    try {
+      data = await tryOpenMeteo(lat, lon);
+    } catch (e1) {
+      // 2) fallback wttr.in
+      data = await tryWttr(lat, lon);
+    }
 
     WEATHER_CACHE = {
       ok: true,
@@ -241,20 +285,25 @@ app.get("/weather", async (req, res) => {
       max: data.max,
       updatedAt: new Date().toISOString(),
       stale: false,
+      provider: data.provider,
     };
 
     return res.json(WEATHER_CACHE);
   } catch (e) {
-    // ✅ Se falhar, mas temos cache, devolve cache "stale" (não some do painel)
+    // Se já temos cache, devolve cache stale (não some do painel)
     if (WEATHER_CACHE?.ok) {
-      return res.json({ ...WEATHER_CACHE, stale: true, error: "Falha ao atualizar agora." });
+      return res.json({
+        ...WEATHER_CACHE,
+        stale: true,
+        error: "Falha ao atualizar agora.",
+      });
     }
 
-    // Sem cache ainda → devolve erro com detalhe (pra debug)
+    // Sem cache ainda → devolve erro com detalhe
     return res.status(502).json({
       ok: false,
-      error: "Falha ao obter clima (Open-Meteo).",
-      details: String(e?.message || e).slice(0, 180),
+      error: "Falha ao obter clima (provedores indisponíveis).",
+      details: String(e?.message || e).slice(0, 220),
     });
   }
 });
@@ -263,5 +312,6 @@ app.get("/weather", async (req, res) => {
 // ============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚨 RADAR API NOVA SUBIU — server.js ATUAL — porta", PORT));
+
 
 
