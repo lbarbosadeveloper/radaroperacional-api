@@ -1,20 +1,20 @@
-// server.js (API para Render / Railway)
-// - GET /health
-// - GET /search?q=...&sites=dom1,dom2
-//
-// Recomendado: usar esse server separado do GitHub Pages (Pages = front estático)
-
+// server.js
 import express from "express";
 import cors from "cors";
+
+// ✅ Fallback pro fetch (resolve “clima não aparece” em Node/Render quando fetch não existe)
+// Se seu Node já tiver fetch, isso não atrapalha.
+let _fetch = globalThis.fetch;
+if (!_fetch) {
+  const mod = await import("node-fetch");
+  _fetch = mod.default;
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ============================
-// ✅ CORS (GitHub Pages + local)
-// ============================
 const ALLOWED_ORIGINS = new Set([
-  "https://lbarbosadeveloper.github.io", // seu GitHub Pages (domínio)
+  "https://lbarbosadeveloper.github.io",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "http://localhost:5500",
@@ -24,268 +24,144 @@ const ALLOWED_ORIGINS = new Set([
 app.use(
   cors({
     origin(origin, cb) {
-      // requests sem origin (curl/postman) passam
       if (!origin) return cb(null, true);
-
-      // libera o domínio do pages + variações de porta (local)
       if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
-
-      // opcional: liberar qualquer subpath do github.io (origin vem só domínio)
-      // se quiser liberar qualquer usuário no github.io, use:
-      // if (origin.endsWith(".github.io")) return cb(null, true);
-
-      return cb(new Error("CORS bloqueado: " + origin));
+      return cb(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
   })
 );
 
 // ============================
-// Health check (pra testar no browser)
+// Health
 // ============================
-app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/_whoami", (_req, res) => {
+  res.json({
+    ok: true,
+    build: "RADAR-WHOAMI-001",
+    time: new Date().toISOString()
+  });
 });
 
+
 // ============================
-// Helpers RSS (sem libs)
+// ✅ CLIMATEMPO /weather
 // ============================
-function decodeEntities(str = "") {
-  let s = String(str);
+const CT_BASE = "https://apiadvisor.climatempo.com.br/api/v1";
+const CT_TOKEN = process.env.CLIMATEMPO_TOKEN || "";
+let cachedLocaleId = process.env.CLIMATEMPO_LOCALE_ID || "";
 
-  s = s
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'")
-    .replaceAll("&nbsp;", " ");
+// você pode trocar isso quando quiser
+const DEFAULT_CITY_NAME = "Agua Santa"; // sem acento costuma ser mais safe
+const DEFAULT_STATE = "RJ";
 
-  s = s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
-  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-
-  return s;
+function mustToken() {
+  if (!CT_TOKEN) {
+    const e = new Error("Falta CLIMATEMPO_TOKEN nas variáveis de ambiente.");
+    e.status = 500;
+    throw e;
+  }
 }
 
-function stripTags(html = "") {
-  let s = String(html || "");
-  for (let i = 0; i < 3; i++) s = decodeEntities(s);
-
-  s = s.replace(/<[^>]*>/g, " ");
-  s = s.replace(/https?:\/\/\S+/gi, " ");
-  return s.replace(/\s+/g, " ").trim();
-}
-
-function pickTag(block, tag) {
-  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
-  const m = block.match(re);
-  return m ? m[1].trim() : "";
-}
-
-function pickAttrTag(block, tag, attrName) {
-  const re = new RegExp(`<${tag}\\b[^>]*${attrName}="([^"]+)"[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
-  const m = block.match(re);
-  if (!m) return null;
-  return { attr: m[1]?.trim() || "", text: (m[2] || "").trim() };
-}
-
-function getHostSafe(u) {
+async function ctFetchJson(url) {
+  const r = await _fetch(url, { headers: { "User-Agent": "radar-operacional/1.0" } });
+  const text = await r.text();
+  if (!r.ok) {
+    const e = new Error(`ClimaTempo HTTP ${r.status}: ${text.slice(0, 200)}`);
+    e.status = 502;
+    throw e;
+  }
   try {
-    const x = new URL(u);
-    return x.hostname.replace(/^www\./i, "").toLowerCase();
+    return JSON.parse(text);
   } catch {
-    return "";
+    const e = new Error("Resposta inválida (não-JSON) da ClimaTempo.");
+    e.status = 502;
+    throw e;
   }
 }
 
-function parseRss(xmlText = "") {
-  const xml = String(xmlText);
+async function resolveLocaleId({ name, state }) {
+  if (cachedLocaleId) return cachedLocaleId;
 
-  const items = [];
-  const itemRe = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+  const url =
+    `${CT_BASE}/locale/city?name=${encodeURIComponent(name)}&state=${encodeURIComponent(state)}&token=${encodeURIComponent(CT_TOKEN)}`;
 
-  let m;
-  while ((m = itemRe.exec(xml)) !== null) {
-    const itemXml = m[1];
+  const arr = await ctFetchJson(url);
 
-    const title = decodeEntities(pickTag(itemXml, "title"));
-    const link = decodeEntities(pickTag(itemXml, "link"));
-    const pubDateRaw = decodeEntities(pickTag(itemXml, "pubDate"));
-
-    const sourceObj = pickAttrTag(itemXml, "source", "url");
-    const sourceName = sourceObj ? decodeEntities(sourceObj.text) : "";
-    const sourceUrl = sourceObj ? decodeEntities(sourceObj.attr) : "";
-
-    const descRaw = pickTag(itemXml, "description");
-    const snippet = stripTags(descRaw);
-
-    let publishedAt = null;
-    if (pubDateRaw) {
-      const d = new Date(pubDateRaw);
-      if (!Number.isNaN(d.getTime())) publishedAt = d.toISOString();
-    }
-
-    items.push({
-      title,
-      url: link, // muitas vezes news.google.com
-      snippet,
-      source: sourceName || (sourceUrl ? sourceUrl : ""),
-      publishedAt,
-      publisherUrl: "",
-      publisherDomain: "",
-    });
+  // normalmente vem array de cidades
+  const first = Array.isArray(arr) ? arr[0] : null;
+  const id = first?.id;
+  if (!id) {
+    const e = new Error("Não achei locale id da cidade na ClimaTempo.");
+    e.status = 404;
+    throw e;
   }
 
-  return items;
+  cachedLocaleId = String(id);
+  return cachedLocaleId;
 }
 
-function normalizeDomainList(raw) {
-  if (!raw) return [];
-  return String(raw)
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((d) =>
-      d
-        .replace(/^https?:\/\//i, "")
-        .replace(/^www\./i, "")
-        .replace(/\/.*$/, "")
-        .toLowerCase()
-    );
-}
-
-function buildGoogleNewsQuery(keyword, sites = []) {
-  const k = String(keyword || "").trim();
-  if (!k) return "";
-  if (!sites.length) return k;
-
-  const sitePart = sites.map((d) => `site:${d}`).join(" OR ");
-  return `(${k}) (${sitePart})`;
-}
-
-// ============================
-// ✅ Resolver redirect do Google News -> Publisher real
-// ============================
-function isGoogleNewsHost(host) {
-  const h = String(host || "").toLowerCase();
-  return h === "news.google.com" || h.endsWith(".news.google.com");
-}
-
-function isGoogleHost(host) {
-  const h = String(host || "").toLowerCase();
-  return h === "google.com" || h.endsWith(".google.com");
-}
-
-async function resolvePublisherFromGoogleNewsUrl(gnUrl, timeoutMs = 4500) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
+app.get("/weather", async (req, res) => {
   try {
-    const r = await fetch(gnUrl, {
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (RadarOperacional; Node)",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
+    mustToken();
+
+    const cityName = String(req.query.city || DEFAULT_CITY_NAME);
+    const state = String(req.query.state || DEFAULT_STATE);
+
+    const localeId = await resolveLocaleId({ name: cityName, state });
+
+    // 1) clima atual
+    const currentUrl =
+      `${CT_BASE}/weather/locale/${encodeURIComponent(localeId)}/current?token=${encodeURIComponent(CT_TOKEN)}`;
+    const current = await ctFetchJson(currentUrl);
+
+    // 2) previsão 15 dias (pra pegar min/max do dia 0)
+    const daysUrl =
+      `${CT_BASE}/forecast/locale/${encodeURIComponent(localeId)}/days/15?token=${encodeURIComponent(CT_TOKEN)}`;
+    const forecast = await ctFetchJson(daysUrl);
+
+    const day0 = forecast?.data?.[0] || null;
+
+    // pega o melhor “texto de condição” disponível (ClimaTempo varia chaves)
+    const cond =
+      current?.data?.condition ||
+      current?.data?.text ||
+      current?.data?.text_pt ||
+      current?.data?.phrase ||
+      day0?.text_phrase?.reduced ||
+      day0?.text ||
+      "—";
+
+    const min = day0?.temperature?.min ?? day0?.temperature_min ?? null;
+    const max = day0?.temperature?.max ?? day0?.temperature_max ?? null;
+
+    const place =
+      forecast?.name && forecast?.state
+        ? `${forecast.name} • ${forecast.state}`
+        : `Água Santa • RJ`;
+
+    res.json({
+      ok: true,
+      place,
+      cond,
+      min,
+      max,
+      localeId,
+      updatedAt: new Date().toISOString(),
     });
-
-    const finalUrl = r.url || "";
-    const host = getHostSafe(finalUrl);
-
-    if (!finalUrl) return { publisherUrl: "", publisherDomain: "" };
-    if (isGoogleNewsHost(host) || isGoogleHost(host)) return { publisherUrl: "", publisherDomain: "" };
-
-    return { publisherUrl: finalUrl, publisherDomain: host };
-  } catch {
-    return { publisherUrl: "", publisherDomain: "" };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// pool simples de concorrência
-async function mapPool(items, concurrency, mapper) {
-  const out = new Array(items.length);
-  let idx = 0;
-
-  async function worker() {
-    while (idx < items.length) {
-      const i = idx++;
-      out[i] = await mapper(items[i], i);
-    }
-  }
-
-  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
-  await Promise.all(workers);
-  return out;
-}
-
-// ============================
-// /search
-// ============================
-app.get("/search", async (req, res) => {
-  try {
-    const q = String(req.query.q || "").trim();
-    if (!q) return res.json({ results: [] });
-
-    const sites = normalizeDomainList(req.query.sites);
-    const query = buildGoogleNewsQuery(q, sites);
-
-    const rssUrl =
-      `https://news.google.com/rss/search?q=${encodeURIComponent(query)}` +
-      `&hl=pt-BR&gl=BR`;
-
-    const r = await fetch(rssUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (RadarOperacional; RSS)",
-        Accept: "application/rss+xml,text/xml;q=0.9,*/*;q=0.8",
-      },
-    });
-
-    if (!r.ok) {
-      console.error("Google RSS HTTP", r.status);
-      return res.status(502).json({ results: [], error: "rss_http_" + r.status });
-    }
-
-    const xml = await r.text();
-    const items = parseRss(xml).filter((it) => it.url && it.title).slice(0, 10);
-
-    // Enriquecer publisherUrl/publisherDomain
-    const enriched = await mapPool(items, 3, async (it) => {
-      const host = getHostSafe(it.url);
-      if (isGoogleNewsHost(host)) {
-        const resolved = await resolvePublisherFromGoogleNewsUrl(it.url);
-        return { ...it, ...resolved };
-      }
-      return { ...it, publisherUrl: it.url, publisherDomain: getHostSafe(it.url) };
-    });
-
-    const results = enriched.map((it) => ({
-      title: it.title,
-      snippet: it.snippet,
-      source: it.source,
-      url: it.url,
-      publishedAt: it.publishedAt,
-      publisherUrl: it.publisherUrl,
-      publisherDomain: it.publisherDomain,
-    }));
-
-    return res.json({ results });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ results: [], error: "search_failed" });
+    res.status(e.status || 500).json({ ok: false, error: e.message || "Erro no /weather" });
   }
 });
 
-// Root opcional
-app.get("/", (req, res) => {
-  res.send("Radar Operacional API ok. Use /health e /search.");
-});
+// ============================
+// ⚠️ Aqui ficam as suas outras rotas (/search, /cor/estagio, etc.)
+// (mantém como já estava no seu projeto)
+// ============================
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`API online na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log("🚨 RADAR API NOVA SUBIU — server.js ATUAL — porta", PORT));
+
+
 
