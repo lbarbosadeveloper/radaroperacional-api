@@ -151,93 +151,61 @@ app.get("/search", async (req, res) => {
 // ============================
 // ✅ CLIMATEMPO /weather
 // ============================
-const CT_BASE = "https://apiadvisor.climatempo.com.br/api/v1";
-const CT_TOKEN = process.env.CLIMATEMPO_TOKEN || "";
-let cachedLocaleId = process.env.CLIMATEMPO_LOCALE_ID || "";
+// ============================
+// ✅ WEATHER (sem token) — Open-Meteo
+// Mantém a mesma resposta: { ok, place, cond, min, max, updatedAt }
+// ============================
 
-const DEFAULT_CITY_NAME = "Agua Santa";
-const DEFAULT_STATE = "RJ";
+// Água Santa / RJ (aprox) — ajuste se quiser
+const WX_DEFAULT = {
+  place: "Água Santa • RJ",
+  lat: -22.8776,
+  lon: -43.3043,
+};
 
-function mustToken() {
-  if (!CT_TOKEN) {
-    const e = new Error("Falta CLIMATEMPO_TOKEN nas variáveis de ambiente.");
-    e.status = 500;
-    throw e;
-  }
-}
-
-async function ctFetchJson(url) {
-  const r = await _fetch(url, { headers: { "User-Agent": "radar-operacional/1.0" } });
-  const text = await r.text();
-  if (!r.ok) {
-    const e = new Error(`ClimaTempo HTTP ${r.status}: ${text.slice(0, 200)}`);
-    e.status = 502;
-    throw e;
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    const e = new Error("Resposta inválida (não-JSON) da ClimaTempo.");
-    e.status = 502;
-    throw e;
-  }
-}
-
-async function resolveLocaleId({ name, state }) {
-  if (cachedLocaleId) return cachedLocaleId;
-
-  const url =
-    `${CT_BASE}/locale/city?name=${encodeURIComponent(name)}&state=${encodeURIComponent(state)}&token=${encodeURIComponent(CT_TOKEN)}`;
-
-  const arr = await ctFetchJson(url);
-
-  const first = Array.isArray(arr) ? arr[0] : null;
-  const id = first?.id;
-  if (!id) {
-    const e = new Error("Não achei locale id da cidade na ClimaTempo.");
-    e.status = 404;
-    throw e;
-  }
-
-  cachedLocaleId = String(id);
-  return cachedLocaleId;
+function codeToPt(code) {
+  // WMO weather codes (bem resumido)
+  if (code === 0) return "Céu limpo";
+  if (code === 1 || code === 2) return "Poucas nuvens";
+  if (code === 3) return "Nublado";
+  if (code === 45 || code === 48) return "Neblina";
+  if ([51, 53, 55].includes(code)) return "Garoa";
+  if ([56, 57].includes(code)) return "Garoa congelante";
+  if ([61, 63, 65].includes(code)) return "Chuva";
+  if ([66, 67].includes(code)) return "Chuva congelante";
+  if ([71, 73, 75, 77].includes(code)) return "Neve";
+  if ([80, 81, 82].includes(code)) return "Pancadas de chuva";
+  if ([85, 86].includes(code)) return "Pancadas de neve";
+  if ([95, 96, 99].includes(code)) return "Tempestade";
+  return "—";
 }
 
 app.get("/weather", async (req, res) => {
   try {
-    mustToken();
+    const lat = Number(req.query.lat ?? WX_DEFAULT.lat);
+    const lon = Number(req.query.lon ?? WX_DEFAULT.lon);
+    const place = String(req.query.place || WX_DEFAULT.place);
 
-    const cityName = String(req.query.city || DEFAULT_CITY_NAME);
-    const state = String(req.query.state || DEFAULT_STATE);
+    const url =
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${encodeURIComponent(lat)}` +
+      `&longitude=${encodeURIComponent(lon)}` +
+      `&current=weather_code,temperature_2m` +
+      `&daily=temperature_2m_min,temperature_2m_max` +
+      `&timezone=America%2FSao_Paulo`;
 
-    const localeId = await resolveLocaleId({ name: cityName, state });
+    const r = await _fetch(url, { headers: { "User-Agent": "radar-operacional/1.0" } });
+    const j = await r.json().catch(() => null);
 
-    const currentUrl =
-      `${CT_BASE}/weather/locale/${encodeURIComponent(localeId)}/current?token=${encodeURIComponent(CT_TOKEN)}`;
-    const current = await ctFetchJson(currentUrl);
+    if (!r.ok || !j) {
+      return res.status(502).json({ ok: false, error: "Falha ao obter clima (Open-Meteo)." });
+    }
 
-    const daysUrl =
-      `${CT_BASE}/forecast/locale/${encodeURIComponent(localeId)}/days/15?token=${encodeURIComponent(CT_TOKEN)}`;
-    const forecast = await ctFetchJson(daysUrl);
+    const code = j?.current?.weather_code;
+    const cond = codeToPt(code);
 
-    const day0 = forecast?.data?.[0] || null;
-
-    const cond =
-      current?.data?.condition ||
-      current?.data?.text ||
-      current?.data?.text_pt ||
-      current?.data?.phrase ||
-      day0?.text_phrase?.reduced ||
-      day0?.text ||
-      "—";
-
-    const min = day0?.temperature?.min ?? day0?.temperature_min ?? null;
-    const max = day0?.temperature?.max ?? day0?.temperature_max ?? null;
-
-    const place =
-      forecast?.name && forecast?.state
-        ? `${forecast.name} • ${forecast.state}`
-        : `Água Santa • RJ`;
+    const min = j?.daily?.temperature_2m_min?.[0] ?? null;
+    const max = j?.daily?.temperature_2m_max?.[0] ?? null;
 
     res.json({
       ok: true,
@@ -245,11 +213,10 @@ app.get("/weather", async (req, res) => {
       cond,
       min,
       max,
-      localeId,
       updatedAt: new Date().toISOString(),
     });
   } catch (e) {
-    res.status(e.status || 500).json({ ok: false, error: e.message || "Erro no /weather" });
+    res.status(500).json({ ok: false, error: e?.message || "Erro no /weather" });
   }
 });
 
@@ -258,3 +225,4 @@ app.get("/weather", async (req, res) => {
 // ============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚨 RADAR API NOVA SUBIU — server.js ATUAL — porta", PORT));
+
